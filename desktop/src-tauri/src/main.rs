@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod capture;
+mod ai;
 mod crypto;
 mod dates;
 mod repository;
+mod reports;
 mod windows;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -43,6 +45,7 @@ fn clock(
     let mut store = state.store.lock().map_err(|_| "状态忙")?;
     if store.is_locked() { return Err("应用已锁定，请先解锁".into()); }
     store.clock(&action)?;
+    let _ = store.maybe_auto_report(chrono::Utc::now().timestamp());
     changed(&app);
     Ok(())
 }
@@ -105,6 +108,8 @@ struct Settings {
     shortcut: String,
     lock_enabled: bool,
     locked: bool,
+    report_auto_enabled: bool,
+    report_weekday: i64,
 }
 #[tauri::command]
 fn settings(
@@ -113,9 +118,9 @@ fn settings(
     state: State<AppState>,
 ) -> Result<Settings, String> {
     allowed(&w, &["main"])?;
-    let (lock_enabled, locked) = {
+    let (lock_enabled, locked, report_auto_enabled, report_weekday) = {
         let store = state.store.lock().map_err(|_| "状态忙")?;
-        (store.lock_enabled(), store.is_locked())
+        (store.lock_enabled(), store.is_locked(), store.report_auto_enabled(), store.report_weekday())
     };
     Ok(Settings {
         autostart: app
@@ -125,6 +130,8 @@ fn settings(
         shortcut: state.shortcut.lock().map_err(|_| "状态忙")?.clone(),
         lock_enabled,
         locked,
+        report_auto_enabled,
+        report_weekday,
     })
 }
 
@@ -185,6 +192,111 @@ fn set_autostart(w: WebviewWindow, app: tauri::AppHandle, enabled: bool) -> Resu
         app.autolaunch().disable()
     }
     .map_err(|_| "开机启动设置失败".into())
+}
+
+#[tauri::command]
+fn report_candidates(w: WebviewWindow, state: State<AppState>, report_type: String, range_start: String, range_end: String) -> Result<Vec<reports::ReportCandidate>, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.report_candidates(&report_type, &range_start, &range_end)
+}
+
+#[tauri::command]
+fn reports(w: WebviewWindow, state: State<AppState>) -> Result<Vec<reports::ReportSummary>, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.reports()
+}
+
+#[tauri::command]
+fn report(w: WebviewWindow, state: State<AppState>, id: i64) -> Result<reports::ReportDetail, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.report(id)
+}
+
+#[tauri::command]
+fn generate_local_report(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, input: reports::ReportInput) -> Result<reports::ReportDetail, String> {
+    allowed(&w, &["main"])?;
+    let result = state.store.lock().map_err(|_| "状态忙")?.generate_local_report(input)?;
+    changed(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn generate_ai_report(w: WebviewWindow, app: tauri::AppHandle, state: State<'_, AppState>, input: reports::ReportInput) -> Result<reports::ReportDetail, String> {
+    allowed(&w, &["main"])?;
+    let (settings, tasks) = {
+        let store = state.store.lock().map_err(|_| "状态忙")?;
+        (store.ai_runtime_settings()?, store.selected_report_candidates(&input)?)
+    };
+    let request_input = input.clone();
+    let request_tasks = tasks.clone();
+    let body = tauri::async_runtime::spawn_blocking(move || ai::generate(settings, &request_input, &request_tasks)).await.map_err(|_| "AI 请求线程异常")??;
+    let result = state.store.lock().map_err(|_| "状态忙")?.create_report(input, tasks, body, "ai", "manual")?;
+    changed(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+fn save_report(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, input: reports::ReportEdit) -> Result<reports::ReportDetail, String> {
+    allowed(&w, &["main"])?;
+    let result = state.store.lock().map_err(|_| "状态忙")?.save_report(input)?;
+    changed(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+fn sync_report(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, id: i64) -> Result<reports::ReportDetail, String> {
+    allowed(&w, &["main"])?;
+    let result = state.store.lock().map_err(|_| "状态忙")?.sync_report(id)?;
+    changed(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+fn copy_report(w: WebviewWindow, state: State<AppState>, id: i64, format: String) -> Result<(), String> {
+    allowed(&w, &["main"])?;
+    let (_, body) = state.store.lock().map_err(|_| "状态忙")?.report_text(id, format == "markdown")?;
+    let owner = w.hwnd().map_err(|_| "无法读取主窗口")?.0 as usize;
+    capture::copy_text(owner, &body)
+}
+
+#[tauri::command]
+fn export_report(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, id: i64, format: String) -> Result<String, String> {
+    allowed(&w, &["main"])?;
+    if !["markdown", "text"].contains(&format.as_str()) { return Err("导出格式无效".into()); }
+    let (title, body) = state.store.lock().map_err(|_| "状态忙")?.report_text(id, format == "markdown")?;
+    let directory = app.path().download_dir().unwrap_or(app.path().app_data_dir().map_err(|_| "无法定位导出目录")?.join("exports"));
+    std::fs::create_dir_all(&directory).map_err(|_| "导出目录创建失败")?;
+    let safe_title = title.chars().map(|character| if "\\/:*?\"<>|".contains(character) {'_'} else {character}).collect::<String>();
+    let extension = if format == "markdown" { "md" } else { "txt" };
+    let path = directory.join(format!("{}-{}.{}", safe_title, chrono::Local::now().format("%Y%m%d-%H%M%S"), extension));
+    std::fs::write(&path, body).map_err(|_| "报告导出失败")?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn set_report_schedule(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, enabled: bool, weekday: i64) -> Result<(), String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.save_report_schedule(enabled, weekday)?;
+    changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn take_report_notice(w: WebviewWindow, state: State<AppState>) -> Result<Option<String>, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.take_report_notice()
+}
+
+#[tauri::command]
+fn ai_settings(w: WebviewWindow, state: State<AppState>) -> Result<ai::AiSettings, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.ai_settings()
+}
+
+#[tauri::command]
+fn save_ai_settings(w: WebviewWindow, state: State<AppState>, input: ai::AiSettingsInput) -> Result<ai::AiSettings, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.save_ai_settings(input)
 }
 fn register(app: &tauri::AppHandle, key: &str) -> Result<(), String> {
     app.global_shortcut()
@@ -287,11 +399,25 @@ fn main() {
             create_backup,
             restore_backup,
             unlock,
-            set_app_lock
+            set_app_lock,
+            report_candidates,
+            reports,
+            report,
+            generate_local_report,
+            generate_ai_report,
+            save_report,
+            sync_report,
+            copy_report,
+            export_report,
+            set_report_schedule,
+            take_report_notice,
+            ai_settings,
+            save_ai_settings
         ])
         .setup(|app| {
             let dir = app.path().app_data_dir()?.join("data");
-            let store = repository::Store::open(&dir).map_err(std::io::Error::other)?;
+            let mut store = repository::Store::open(&dir).map_err(std::io::Error::other)?;
+            let _ = store.maybe_auto_report(chrono::Utc::now().timestamp());
             let key = store
                 .setting("shortcut")
                 .unwrap_or("Ctrl+Shift+Space".into());
@@ -301,6 +427,15 @@ fn main() {
                 shortcut: Mutex::new(String::new()),
                 capture_busy: AtomicBool::new(false),
                 move_version: AtomicU64::new(0),
+            });
+            let scheduler = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let generated = scheduler.state::<AppState>().store.lock().ok().and_then(|mut store| store.maybe_auto_report(chrono::Utc::now().timestamp()).ok()).flatten();
+                if generated.is_some() {
+                    changed(&scheduler);
+                    let _ = scheduler.emit("report-generated", ());
+                }
             });
             for config in &app.config().app.windows {
                 tauri::WebviewWindowBuilder::from_config(app, config)?.build()?;

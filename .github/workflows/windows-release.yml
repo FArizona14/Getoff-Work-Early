@@ -1,0 +1,104 @@
+name: Windows build and release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    env:
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Verify frontend and Rust tests
+        shell: pwsh
+        run: |
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Build unsigned Windows installer
+        if: ${{ env.WINDOWS_CERTIFICATE_BASE64 == '' }}
+        run: npm run desktop:build
+
+      - name: Build Authenticode-signed Windows installer
+        if: ${{ env.WINDOWS_CERTIFICATE_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          try {
+            $configPath = Join-Path $env:RUNNER_TEMP 'tauri-signing.json'
+            @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $certificate.Thumbprint
+                  digestAlgorithm = 'sha256'
+                  timestampUrl = 'http://timestamp.digicert.com'
+                }
+              }
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $configPath -Encoding utf8
+            npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config $configPath -- --locked
+            if ($LASTEXITCODE) { throw 'Signed Tauri build failed' }
+          } finally {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $releaseDirectory = 'release-artifacts'
+          New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+          Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe |
+            Copy-Item -Destination $releaseDirectory
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/early-off-work.exe (Join-Path $releaseDirectory 'Early-Off-Work-portable.exe')
+          Get-ChildItem $releaseDirectory -File | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Add-Content (Join-Path $releaseDirectory 'SHA256SUMS.txt')
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: early-off-work-windows-x64
+          path: desktop/release-artifacts/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: desktop/release-artifacts/*

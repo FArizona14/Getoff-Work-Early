@@ -177,3 +177,16 @@ pub fn capture(owner: usize) -> Draft {
         notice,
     })
 }
+
+pub fn copy_text(owner: usize, text: &str) -> Result<(), String> {
+    if text.is_empty() || text.len() > 512 * 1024 {
+        return Err("复制内容长度无效".into());
+    }
+    unsafe {
+        if OpenClipboard(owner as HWND) == 0 {
+            return Err("剪贴板被占用，请稍后重试".into());
+        }
+        let _guard = Clipboard;
+        write_text(text)
+    }
+}
