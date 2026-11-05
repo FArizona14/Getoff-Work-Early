@@ -21,7 +21,7 @@
 
 ### 使用说明
 
-- 推荐下载 `早点下班-0.1.0-alpha.1-x64-setup.exe`。
+- 推荐下载 `Getoff-Work-Early-0.1.0-alpha.1-x64-setup.exe`。
 - 安装包尚未签名，Windows 可能显示“未知发布者”或 SmartScreen 提示。
 - 首次运行数据保存在 `%APPDATA%/com.zaodianxiaban.app/data/`，卸载默认保留数据。
 - 当前剪贴板含图片、文件或富文本时，应用会跳过自动复制并提示手动粘贴。

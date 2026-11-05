@@ -1,2 +1,2 @@
-90a2b800b5e7b93fd4fd8328c5b9f20eaad0782f4a98d33222b1d7ea0cea4e1b  早点下班-0.1.0-alpha.1-x64-setup.exe
-051b1258a616c3bb64857d7f1665744bcfa09a16e62af68d452078c69a8d1703  早点下班-0.1.0-alpha.1-x64.exe
+90a2b800b5e7b93fd4fd8328c5b9f20eaad0782f4a98d33222b1d7ea0cea4e1b  Getoff-Work-Early-0.1.0-alpha.1-x64-setup.exe
+051b1258a616c3bb64857d7f1665744bcfa09a16e62af68d452078c69a8d1703  Getoff-Work-Early-0.1.0-alpha.1-x64.exe

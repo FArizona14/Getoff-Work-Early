@@ -10,8 +10,8 @@
 
 请从 [GitHub Releases](https://github.com/FArizona14/Getoff-Work-Early/releases) 下载：
 
-- `早点下班-0.1.0-alpha.1-x64-setup.exe`：Windows x64 当前用户安装包。
-- `早点下班-0.1.0-alpha.1-x64.exe`：免安装运行版。
+- `Getoff-Work-Early-0.1.0-alpha.1-x64-setup.exe`：Windows x64 当前用户安装包。
+- `Getoff-Work-Early-0.1.0-alpha.1-x64.exe`：免安装运行版。
 - `SHA256SUMS.txt`：文件完整性校验值。
 
 这是未签名的内测版本，Windows 可能显示“未知发布者”或 SmartScreen 提示。当前只建议用于技术验证，不要保存唯一一份正式工作资料。
