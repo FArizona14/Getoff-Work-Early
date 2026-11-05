@@ -1,243 +1,76 @@
-use crate::crypto::Crypto;
-use chrono::{Local, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
-use std::path::Path;
+use crate::crypto::{password_decrypt,password_encrypt,Crypto};
+use chrono::{Datelike,Local,NaiveDate,Utc};
+use rusqlite::{params,Connection,DatabaseName,OptionalExtension};
+use serde::{Deserialize,Serialize};
+use sha2::{Digest,Sha256};
+use std::{fs,path::{Path,PathBuf}};
 
-pub struct Store {
-    pub db: Connection,
-    crypto: Crypto,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Snapshot {
-    pub day: String,
-    pub started_at: Option<i64>,
-    pub ended_at: Option<i64>,
-    pub status: String,
-    pub server_now: i64,
-    pub capture_count: i64,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Capture {
-    id: i64,
-    title: String,
-    created_at: i64,
-}
-fn db_error(_: rusqlite::Error) -> String {
-    "数据库操作失败；请检查文件占用或磁盘空间".into()
-}
+pub struct Store { pub db:Connection, crypto:Crypto, dir:PathBuf }
+#[derive(Serialize)] #[serde(rename_all="camelCase")]
+pub struct Snapshot { pub day:String,pub started_at:Option<i64>,pub ended_at:Option<i64>,pub status:String,pub server_now:i64,pub target_seconds:i64,pub today_count:i64,pub done_count:i64,pub future_count:i64,pub inbox_count:i64,pub current_task:Option<TaskSummary>,pub locked:bool }
+#[derive(Serialize)] #[serde(rename_all="camelCase")] pub struct TaskSummary { pub id:i64,pub title:String }
+#[derive(Serialize)] #[serde(rename_all="camelCase")]
+pub struct Task { pub id:i64,pub title:String,pub notes:String,pub result:String,pub status:String,pub planned_date:Option<String>,pub date_kind:String,pub due_at:Option<i64>,pub priority:String,pub project:String,pub source:String,pub created_at:i64,pub updated_at:i64,pub completed_at:Option<i64> }
+#[derive(Deserialize)] #[serde(rename_all="camelCase")]
+pub struct TaskInput { pub id:Option<i64>,pub title:String,pub notes:Option<String>,pub planned_date:Option<String>,pub date_kind:Option<String>,pub due_at:Option<i64>,pub priority:Option<String>,pub project:Option<String>,pub source:Option<String> }
+#[derive(Serialize,Deserialize,Clone)] #[serde(rename_all="camelCase")]
+pub struct Preferences { pub target_seconds:i64,pub salary_type:String,pub salary_value:String,pub workdays_month:i64,pub workdays_year:i64,pub privacy_mode:bool,pub show_amount:bool,pub fun_mode:bool }
+#[derive(Serialize)] #[serde(rename_all="camelCase")] pub struct Workday { pub day:String,pub started_at:i64,pub ended_at:Option<i64>,pub target_seconds:i64,pub revised_at:Option<i64> }
+#[derive(Deserialize)] #[serde(rename_all="camelCase")] pub struct WorkdayInput { pub day:String,pub started_at:i64,pub ended_at:Option<i64>,pub reason:String }
+#[derive(Serialize)] #[serde(rename_all="camelCase")] pub struct BackupInfo { pub id:String,pub created_at:i64,pub kind:String,pub size:i64,pub checksum:String,pub location:String }
+
+fn db_error(e:rusqlite::Error)->String{format!("数据库操作失败：{e}")}
+fn bool_setting(s:Option<String>,default:bool)->bool{s.map(|v|v=="true").unwrap_or(default)}
 impl Store {
-    pub fn open(dir: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir).map_err(|_| "数据目录创建失败")?;
-        let path = dir.join("app.db");
-        let crypto = Crypto::open(dir, path.exists())?;
-        let mut db = Connection::open(&path).map_err(db_error)?;
-        db.busy_timeout(std::time::Duration::from_secs(3))
-            .map_err(db_error)?;
-        db.pragma_update(None, "foreign_keys", "ON")
-            .map_err(db_error)?;
-        let version: i64 = db
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .map_err(db_error)?;
-        if version > 1 {
-            return Err("数据库来自较新版本，请升级应用".into());
-        }
-        if version < 1 {
-            db.backup(
-                rusqlite::DatabaseName::Main,
-                dir.join("before-migration-v1.db"),
-                None,
-            )
-            .map_err(db_error)?;
-            let tx = db.transaction().map_err(db_error)?;
-            tx.execute_batch(include_str!("../migrations/001_initial.sql"))
-                .map_err(db_error)?;
-            tx.pragma_update(None, "user_version", 1)
-                .map_err(db_error)?;
-            tx.commit().map_err(db_error)?;
-        }
-        db.pragma_update(None, "journal_mode", "WAL")
-            .map_err(db_error)?;
-        Ok(Self { db, crypto })
-    }
-    pub fn snapshot(&self) -> Result<Snapshot, String> {
-        self.snapshot_at(
-            Utc::now().timestamp(),
-            &Local::now().format("%Y-%m-%d").to_string(),
-        )
-    }
-    fn snapshot_at(&self, now: i64, today: &str) -> Result<Snapshot, String> {
-        let row:Option<(String,i64,Option<i64>)>=self.db.query_row("SELECT day,started_at,ended_at FROM workdays WHERE ended_at IS NULL OR day=?1 ORDER BY started_at LIMIT 1",[today],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_error)?;
-        let (day, started_at, ended_at) =
-            row.map(|(d, s, e)| (d, Some(s), e))
-                .unwrap_or((today.into(), None, None));
-        let status = match (started_at, ended_at) {
-            (_, Some(_)) => "finished",
-            (Some(s), None) if now - s >= 9 * 3600 => "overtime",
-            (Some(_), None) => "working",
-            _ => "idle",
-        }
-        .into();
-        Ok(Snapshot {
-            day,
-            started_at,
-            ended_at,
-            status,
-            server_now: now,
-            capture_count: self
-                .db
-                .query_row("SELECT count(*) FROM captures", [], |r| r.get(0))
-                .map_err(db_error)?,
-        })
-    }
-    pub fn clock(&mut self, action: &str) -> Result<(), String> {
-        self.clock_at(
-            action,
-            Utc::now().timestamp(),
-            &Local::now().format("%Y-%m-%d").to_string(),
-        )
-    }
-    fn clock_at(&mut self, action: &str, now: i64, today: &str) -> Result<(), String> {
-        let tx = self.db.transaction().map_err(db_error)?;
-        let active: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT day,started_at FROM workdays WHERE ended_at IS NULL LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(db_error)?;
-        match action {
-            "start" => {
-                if active.is_some() {
-                    return Err("已有进行中的打卡".into());
-                }
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM workdays WHERE day=?1)",
-                        [today],
-                        |r| r.get(0),
-                    )
-                    .map_err(db_error)?;
-                if exists {
-                    return Err("当日已下班，不能重新打卡".into());
-                }
-                tx.execute(
-                    "INSERT INTO workdays(day,started_at) VALUES(?1,?2)",
-                    params![today, now],
-                )
-                .map_err(db_error)?;
-            }
-            "finish" => {
-                let (day, start) = active.ok_or("当前没有进行中的打卡")?;
-                if now < start {
-                    return Err("系统时间早于上班时间，请校正系统时钟".into());
-                }
-                tx.execute(
-                    "UPDATE workdays SET ended_at=?1 WHERE day=?2 AND ended_at IS NULL",
-                    params![now, day],
-                )
-                .map_err(db_error)?;
-            }
-            _ => return Err("无效打卡操作".into()),
-        };
-        tx.commit().map_err(db_error)
-    }
-    pub fn add(&self, title: &str) -> Result<(), String> {
-        let title = title.trim();
-        if title.is_empty() || title.chars().count() > 2000 {
-            return Err("请输入 1–2000 字的内容".into());
-        }
-        let encrypted = self.crypto.encrypt(title)?;
-        self.db
-            .execute(
-                "INSERT INTO captures(title,created_at) VALUES(?1,?2)",
-                params![encrypted, Utc::now().timestamp()],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
-    pub fn captures(&self) -> Result<Vec<Capture>, String> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT id,title,created_at FROM captures ORDER BY id DESC LIMIT 50")
-            .map_err(db_error)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(db_error)?;
-        rows.map(|row| {
-            let (id, title, created_at) = row.map_err(db_error)?;
-            Ok(Capture {
-                id,
-                title: self.crypto.decrypt(&title)?,
-                created_at,
-            })
-        })
-        .collect()
-    }
-    pub fn setting(&self, key: &str) -> Option<String> {
-        self.db
-            .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-    }
-    pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
-        self.db.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(db_error)?;
-        Ok(())
-    }
+ pub fn open(dir:&Path)->Result<Self,String>{
+  fs::create_dir_all(dir).map_err(|_|"数据目录创建失败")?; let path=dir.join("app.db"); let crypto=Crypto::open(dir,path.exists())?; let mut db=Connection::open(&path).map_err(db_error)?;
+  db.busy_timeout(std::time::Duration::from_secs(3)).map_err(db_error)?;db.pragma_update(None,"foreign_keys","ON").map_err(db_error)?;
+  let version:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_error)?;if version>2{return Err("数据库来自较新版本，请升级应用".into())}
+  if version<1{db.backup(DatabaseName::Main,dir.join("before-migration-v1.db"),None).map_err(db_error)?;let tx=db.transaction().map_err(db_error)?;tx.execute_batch(include_str!("../migrations/001_initial.sql")).map_err(db_error)?;tx.pragma_update(None,"user_version",1).map_err(db_error)?;tx.commit().map_err(db_error)?;}
+  if version<2{db.backup(DatabaseName::Main,dir.join("before-migration-v2.db"),None).map_err(db_error)?;let tx=db.transaction().map_err(db_error)?;tx.execute_batch(include_str!("../migrations/002_local_loop.sql")).map_err(db_error)?;tx.pragma_update(None,"user_version",2).map_err(db_error)?;tx.commit().map_err(db_error)?;}
+  db.pragma_update(None,"journal_mode","WAL").map_err(db_error)?;Ok(Self{db,crypto,dir:dir.to_path_buf()})
+ }
+ pub fn is_locked(&self)->bool{self.crypto.is_locked()}
+ pub fn lock_enabled(&self)->bool{self.crypto.lock_enabled()}
+ pub fn unlock(&mut self,password:&str)->Result<(),String>{self.crypto.unlock(password)}
+ pub fn set_lock(&mut self,enabled:bool,password:&str)->Result<(),String>{if enabled{self.crypto.enable_lock(password)}else{self.crypto.disable_lock(password)}}
+ pub fn snapshot(&self)->Result<Snapshot,String>{self.snapshot_at(Utc::now().timestamp(),&Local::now().format("%Y-%m-%d").to_string())}
+ fn snapshot_at(&self,now:i64,today:&str)->Result<Snapshot,String>{
+  let row:Option<(String,i64,Option<i64>,i64)>=self.db.query_row("SELECT day,started_at,ended_at,target_seconds FROM workdays WHERE ended_at IS NULL OR day=?1 ORDER BY (ended_at IS NULL) DESC,started_at DESC LIMIT 1",[today],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(db_error)?;
+  let (day,started_at,ended_at,target_seconds)=row.map(|(d,s,e,t)|(d,Some(s),e,t)).unwrap_or((today.into(),None,None,self.target_seconds()));
+  let status=match(started_at,ended_at){(_,Some(_))=>"finished",(Some(s),None)if now-s>=target_seconds=>"overtime",(Some(_),None)=>"working",_=>"idle"}.into();
+  let count=|sql:&str|self.db.query_row(sql,[today],|r|r.get(0)).map_err(db_error);
+  let current_task=if self.crypto.is_locked(){None}else{match self.db.query_row("SELECT id,title FROM tasks WHERE status='in_progress' ORDER BY updated_at DESC LIMIT 1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?))).optional().map_err(db_error)?{Some((id,b))=>Some(TaskSummary{id,title:self.crypto.decrypt(&b)?}),None=>None}};
+  Ok(Snapshot{day,started_at,ended_at,status,server_now:now,target_seconds,today_count:count("SELECT count(*) FROM tasks WHERE status IN ('today','in_progress') AND (planned_date IS NULL OR planned_date<=?1)")?,done_count:count("SELECT count(*) FROM tasks WHERE status='completed' AND date(completed_at,'unixepoch','localtime')=?1")?,future_count:count("SELECT count(*) FROM tasks WHERE status IN ('today','in_progress') AND planned_date>?1")?,inbox_count:count("SELECT count(*) FROM tasks WHERE status='inbox' AND ?1 IS NOT NULL")?,current_task,locked:self.crypto.is_locked()})
+ }
+ pub fn clock(&mut self,action:&str)->Result<(),String>{self.clock_at(action,Utc::now().timestamp(),&Local::now().format("%Y-%m-%d").to_string())}
+ fn clock_at(&mut self,action:&str,now:i64,today:&str)->Result<(),String>{let target=self.target_seconds();let tx=self.db.transaction().map_err(db_error)?;let active:Option<(String,i64)>=tx.query_row("SELECT day,started_at FROM workdays WHERE ended_at IS NULL LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_error)?;match action{"start"=>{if active.is_some(){return Err("已有进行中的打卡".into())}let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workdays WHERE day=?1)",[today],|r|r.get(0)).map_err(db_error)?;if exists{return Err("当日已下班，不能重新打卡".into())}tx.execute("INSERT INTO workdays(day,started_at,target_seconds) VALUES(?1,?2,?3)",params![today,now,target]).map_err(db_error)?},"finish"=>{let(day,start)=active.ok_or("当前没有进行中的打卡")?;if now<start{return Err("系统时间早于上班时间，请校正系统时钟".into())}tx.execute("UPDATE workdays SET ended_at=?1 WHERE day=?2 AND ended_at IS NULL",params![now,day]).map_err(db_error)?},_=>return Err("无效打卡操作".into())};tx.commit().map_err(db_error)}
+ pub fn save_task(&mut self,input:TaskInput)->Result<i64,String>{
+  if self.crypto.is_locked(){return Err("应用已锁定，请先解锁".into())}let title=input.title.trim();if title.is_empty()||title.chars().count()>2000{return Err("请输入 1–2000 字的标题".into())}
+  let now=Utc::now().timestamp();let title=self.crypto.encrypt(title)?;let notes=self.encrypt_opt(input.notes.as_deref())?;let project=self.encrypt_opt(input.project.as_deref())?;let kind=input.date_kind.as_deref().unwrap_or("none");if !["none","exact","month_tbd","uncertain"].contains(&kind){return Err("日期类型无效".into())}let priority=input.priority.as_deref().unwrap_or("medium");if !["high","medium","low"].contains(&priority){return Err("优先级无效".into())}
+  if let Some(id)=input.id{let n=self.db.execute("UPDATE tasks SET title=?1,notes=?2,planned_date=?3,date_kind=?4,due_at=?5,priority=?6,project=?7,updated_at=?8 WHERE id=?9",params![title,notes,input.planned_date,kind,input.due_at,priority,project,now,id]).map_err(db_error)?;if n==0{return Err("任务不存在".into())}Ok(id)}else{let status=if input.source.as_deref()==Some("capture")&&input.planned_date.is_none(){"inbox"}else{"today"};self.db.execute("INSERT INTO tasks(title,notes,status,planned_date,date_kind,due_at,priority,project,source,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",params![title,notes,status,input.planned_date,kind,input.due_at,priority,project,input.source.unwrap_or_else(||"manual".into()),now]).map_err(db_error)?;Ok(self.db.last_insert_rowid())}
+ }
+ fn encrypt_opt(&self,s:Option<&str>)->Result<Option<Vec<u8>>,String>{s.map(str::trim).filter(|v|!v.is_empty()).map(|v|self.crypto.encrypt(v)).transpose()}
+ fn decrypt_opt(&self,b:Option<Vec<u8>>)->Result<String,String>{b.map(|v|self.crypto.decrypt(&v)).transpose().map(|v|v.unwrap_or_default())}
+ pub fn tasks(&self,view:&str,query:&str)->Result<Vec<Task>,String>{if self.crypto.is_locked(){return Err("应用已锁定，请先解锁".into())}let today=Local::now().format("%Y-%m-%d").to_string();let condition=match view{"today"=>"status IN ('today','in_progress') AND (planned_date IS NULL OR planned_date<=?1)","future"=>"status IN ('today','in_progress') AND planned_date>?1","inbox"=>"status='inbox' AND ?1 IS NOT NULL","completed"=>"status='completed' AND ?1 IS NOT NULL","cancelled"=>"status='cancelled' AND ?1 IS NOT NULL","all"=>"?1 IS NOT NULL",_=>return Err("任务视图无效".into())};let sql=format!("SELECT id,title,notes,result,status,planned_date,date_kind,due_at,priority,project,source,created_at,updated_at,completed_at FROM tasks WHERE {condition} ORDER BY status='in_progress' DESC,coalesce(planned_date,'') ASC,priority='high' DESC,updated_at DESC LIMIT 1000");let mut stmt=self.db.prepare(&sql).map_err(db_error)?;let rows=stmt.query_map([today],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,Option<Vec<u8>>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,String>(8)?,r.get::<_,Option<Vec<u8>>>(9)?,r.get::<_,String>(10)?,r.get::<_,i64>(11)?,r.get::<_,i64>(12)?,r.get::<_,Option<i64>>(13)?))).map_err(db_error)?;let mut out=Vec::new();for row in rows{let(id,title,notes,result,status,planned_date,date_kind,due_at,priority,project,source,created_at,updated_at,completed_at)=row.map_err(db_error)?;let task=Task{id,title:self.crypto.decrypt(&title)?,notes:self.decrypt_opt(notes)?,result:self.decrypt_opt(result)?,status,planned_date,date_kind,due_at,priority,project:self.decrypt_opt(project)?,source,created_at,updated_at,completed_at};if query.trim().is_empty()||[&task.title,&task.notes,&task.project,&task.result].iter().any(|s|s.to_lowercase().contains(&query.trim().to_lowercase())){out.push(task)}}Ok(out)}
+ pub fn task_action(&mut self,id:i64,action:&str,result:Option<&str>)->Result<(),String>{if self.crypto.is_locked(){return Err("应用已锁定，请先解锁".into())}let now=Utc::now().timestamp();let tx=self.db.transaction().map_err(db_error)?;match action{"start"=>{tx.execute("UPDATE tasks SET status='today',updated_at=?1 WHERE status='in_progress'",[now]).map_err(db_error)?;if tx.execute("UPDATE tasks SET status='in_progress',updated_at=?1 WHERE id=?2 AND status NOT IN ('completed','cancelled')",params![now,id]).map_err(db_error)?==0{return Err("任务不存在或已结束".into())}},"complete"=>{let encrypted=result.map(str::trim).filter(|s|!s.is_empty()).map(|s|self.crypto.encrypt(s)).transpose()?;if tx.execute("UPDATE tasks SET status='completed',result=coalesce(?1,result),completed_at=?2,updated_at=?2 WHERE id=?3",params![encrypted,now,id]).map_err(db_error)?==0{return Err("任务不存在".into())}},"restore"=>{tx.execute("UPDATE tasks SET status='today',completed_at=NULL,updated_at=?1 WHERE id=?2",params![now,id]).map_err(db_error)?;},"cancel"=>{tx.execute("UPDATE tasks SET status='cancelled',updated_at=?1 WHERE id=?2",params![now,id]).map_err(db_error)?;},"delete"=>{tx.execute("DELETE FROM tasks WHERE id=?1",[id]).map_err(db_error)?;},_=>return Err("任务操作无效".into())};tx.commit().map_err(db_error)}
+ pub fn preferences(&self)->Result<Preferences,String>{Ok(Preferences{target_seconds:self.target_seconds(),salary_type:self.setting("salary_type").unwrap_or("none".into()),salary_value:self.secure_setting("salary_value")?.unwrap_or_default(),workdays_month:self.setting("workdays_month").and_then(|v|v.parse().ok()).unwrap_or_else(default_month_days),workdays_year:self.setting("workdays_year").and_then(|v|v.parse().ok()).unwrap_or(250),privacy_mode:bool_setting(self.setting("privacy_mode"),false),show_amount:bool_setting(self.setting("show_amount"),true),fun_mode:bool_setting(self.setting("fun_mode"),false)})}
+ pub fn save_preferences(&self,p:&Preferences)->Result<(),String>{if !(4*3600..=16*3600).contains(&p.target_seconds){return Err("卡点需在 4–16 小时之间".into())}if !["none","monthly","annual"].contains(&p.salary_type.as_str()){return Err("薪资口径无效".into())}if !p.salary_value.is_empty()&&p.salary_value.parse::<f64>().ok().filter(|v|*v>=0.0&&*v<=1e9).is_none(){return Err("薪资金额无效".into())}for(k,v)in[("target_seconds",p.target_seconds.to_string()),("salary_type",p.salary_type.clone()),("workdays_month",p.workdays_month.to_string()),("workdays_year",p.workdays_year.to_string()),("privacy_mode",p.privacy_mode.to_string()),("show_amount",p.show_amount.to_string()),("fun_mode",p.fun_mode.to_string())]{self.set(k,&v)?}if p.salary_value.is_empty(){self.db.execute("DELETE FROM secure_settings WHERE key='salary_value'",[]).map_err(db_error)?;}else{let v=self.crypto.encrypt(&p.salary_value)?;self.db.execute("INSERT INTO secure_settings VALUES('salary_value',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[v]).map_err(db_error)?;}Ok(())}
+ fn secure_setting(&self,key:&str)->Result<Option<String>,String>{let v:Option<Vec<u8>>=self.db.query_row("SELECT value FROM secure_settings WHERE key=?1",[key],|r|r.get(0)).optional().map_err(db_error)?;v.map(|b|self.crypto.decrypt(&b)).transpose()}
+ fn target_seconds(&self)->i64{self.setting("target_seconds").and_then(|v|v.parse().ok()).unwrap_or(32400)}
+ pub fn workdays(&self)->Result<Vec<Workday>,String>{let mut stmt=self.db.prepare("SELECT day,started_at,ended_at,target_seconds,revised_at FROM workdays ORDER BY day DESC LIMIT 90").map_err(db_error)?;let rows=stmt.query_map([],|r|Ok(Workday{day:r.get(0)?,started_at:r.get(1)?,ended_at:r.get(2)?,target_seconds:r.get(3)?,revised_at:r.get(4)?})).map_err(db_error)?;rows.map(|r|r.map_err(db_error)).collect()}
+ pub fn save_workday(&mut self,input:WorkdayInput)->Result<(),String>{NaiveDate::parse_from_str(&input.day,"%Y-%m-%d").map_err(|_|"工作日格式无效")?;if input.started_at<=0||input.ended_at.is_some_and(|e|e<input.started_at){return Err("下班时间不能早于上班时间".into())}if input.reason.trim().chars().count()<2{return Err("请填写补录或修正原因".into())}let before:Option<(i64,Option<i64>)>=self.db.query_row("SELECT started_at,ended_at FROM workdays WHERE day=?1",[&input.day],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_error)?;let now=Utc::now().timestamp();let target=self.target_seconds();let reason=self.crypto.encrypt(input.reason.trim())?;let tx=self.db.transaction().map_err(db_error)?;tx.execute("INSERT INTO workdays(day,started_at,ended_at,target_seconds,revised_at,revision_reason) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(day) DO UPDATE SET started_at=excluded.started_at,ended_at=excluded.ended_at,revised_at=excluded.revised_at,revision_reason=excluded.revision_reason",params![input.day,input.started_at,input.ended_at,target,now,reason]).map_err(db_error)?;tx.execute("INSERT INTO audit_events(entity_type,entity_id,action,before_json,after_json,reason,created_at) VALUES('workday',?1,'manual_correction',?2,?3,?4,?5)",params![input.day,before.map(|v|serde_json::json!({"startedAt":v.0,"endedAt":v.1}).to_string()),serde_json::json!({"startedAt":input.started_at,"endedAt":input.ended_at}).to_string(),reason,now]).map_err(db_error)?;tx.commit().map_err(db_error)}
+ pub fn create_backup(&self,password:Option<&str>)->Result<BackupInfo,String>{let dir=self.dir.join("backups");fs::create_dir_all(&dir).map_err(|_|"备份目录创建失败")?;let now=Utc::now().timestamp();if let Some(password)=password.filter(|p|!p.is_empty()){let temp=dir.join(format!(".export-{now}.db"));self.db.backup(DatabaseName::Main,&temp,None).map_err(db_error)?;let mut plain=b"EOWDATA2".to_vec();plain.extend(self.crypto.raw_key()?);plain.extend(fs::read(&temp).map_err(|_|"备份读取失败")?);let _=fs::remove_file(&temp);let id=format!("早点下班-{}.eowbak",Local::now().format("%Y%m%d-%H%M%S"));let bytes=password_encrypt(password,&plain)?;let path=dir.join(&id);fs::write(&path,&bytes).map_err(|_|"备份写入失败")?;Ok(info(&path,"portable",now,&bytes))}else{let id=format!("local-{}.db",Local::now().format("%Y%m%d-%H%M%S"));let path=dir.join(&id);self.db.backup(DatabaseName::Main,&path,None).map_err(db_error)?;fs::copy(self.dir.join("user-key.dpapi"),path.with_extension("key")).map_err(|_|"备份密钥写入失败")?;let bytes=fs::read(&path).map_err(|_|"备份读取失败")?;let checksum=hash(&bytes);fs::write(path.with_extension("sha256"),&checksum).map_err(|_|"校验值写入失败")?;self.prune_local(&dir);Ok(info(&path,"local",now,&bytes))}}
+ fn prune_local(&self,dir:&Path){let mut items=fs::read_dir(dir).ok().into_iter().flatten().flatten().filter_map(|e|{let n=e.file_name().to_string_lossy().to_string();n.starts_with("local-").then_some((n,e.path()))}).collect::<Vec<_>>();items.sort_by(|a,b|b.0.cmp(&a.0));for(_,p)in items.into_iter().skip(10){let _=fs::remove_file(&p);let _=fs::remove_file(p.with_extension("key"));let _=fs::remove_file(p.with_extension("sha256"));}}
+ pub fn backups(&self)->Result<Vec<BackupInfo>,String>{let dir=self.dir.join("backups");if !dir.exists(){return Ok(vec![])}let mut out=Vec::new();for e in fs::read_dir(&dir).map_err(|_|"备份目录读取失败")?{let p=e.map_err(|_|"备份目录读取失败")?.path();let ext=p.extension().and_then(|s|s.to_str()).unwrap_or("");if ext!="db"&&ext!="eowbak"{continue}let bytes=fs::read(&p).map_err(|_|"备份读取失败")?;let created=fs::metadata(&p).ok().and_then(|m|m.modified().ok()).and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d|d.as_secs() as i64).unwrap_or(0);out.push(info(&p,if ext=="db"{"local"}else{"portable"},created,&bytes));}out.sort_by(|a,b|b.created_at.cmp(&a.created_at));Ok(out)}
+ pub fn restore_backup(&mut self,id:&str,password:Option<&str>)->Result<(),String>{let item=self.backups()?.into_iter().find(|b|b.id==id).ok_or("备份不存在")?;let path=self.dir.join("backups").join(&item.id);let bytes=fs::read(&path).map_err(|_|"备份读取失败")?;let recovery=self.create_backup(None)?;let result=(||{if item.kind=="local"{let expected=fs::read_to_string(path.with_extension("sha256")).map_err(|_|"备份校验值缺失")?;if expected!=hash(&bytes){return Err("备份校验失败，已停止恢复".into())}validate_db(&path)?;self.db.restore(DatabaseName::Main,&path,None::<fn(rusqlite::backup::Progress)>).map_err(db_error)?;fs::copy(path.with_extension("key"),self.dir.join("user-key.dpapi")).map_err(|_|"备份密钥恢复失败")?;self.crypto=Crypto::open(&self.dir,true)?;}else{let plain=password_decrypt(password.unwrap_or(""),&bytes)?;if plain.len()<40||&plain[..8]!=b"EOWDATA2"{return Err("备份内容损坏".into())}let mut key=[0u8;32];key.copy_from_slice(&plain[8..40]);let temp=self.dir.join("backups").join(".restore.db");fs::write(&temp,&plain[40..]).map_err(|_|"恢复临时文件写入失败")?;validate_db(&temp)?;self.db.restore(DatabaseName::Main,&temp,None::<fn(rusqlite::backup::Progress)>).map_err(db_error)?;let _=fs::remove_file(&temp);self.crypto.replace_key(key)?;}Ok(())})();if result.is_err(){let _=self.restore_backup_inner(&recovery.id);}result}
+ fn restore_backup_inner(&mut self,id:&str)->Result<(),String>{let p=self.dir.join("backups").join(id);self.db.restore(DatabaseName::Main,&p,None::<fn(rusqlite::backup::Progress)>).map_err(db_error)?;fs::copy(p.with_extension("key"),self.dir.join("user-key.dpapi")).map_err(|_|"回滚密钥失败")?;self.crypto=Crypto::open(&self.dir,true)?;Ok(())}
+ pub fn setting(&self,key:&str)->Option<String>{self.db.query_row("SELECT value FROM settings WHERE key=?1",[key],|r|r.get(0)).optional().ok().flatten()}
+ pub fn set(&self,key:&str,value:&str)->Result<(),String>{self.db.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(db_error)?;Ok(())}
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn store() -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("eow-test-{}", rand::random::<u64>()));
-        (Store::open(&path).unwrap(), path)
-    }
-    #[test]
-    fn clock_restart_midnight_and_lock() {
-        let (mut s, p) = store();
-        s.clock_at("start", 100, "2026-11-05").unwrap();
-        assert!(s.clock_at("start", 200, "2026-11-05").is_err());
-        assert_eq!(
-            s.snapshot_at(32500, "2026-11-06").unwrap().status,
-            "overtime"
-        );
-        drop(s);
-        let mut s = Store::open(&p).unwrap();
-        assert_eq!(s.snapshot_at(400, "2026-11-06").unwrap().day, "2026-11-05");
-        assert!(s.clock_at("finish", 99, "2026-11-06").is_err());
-        s.clock_at("finish", 500, "2026-11-06").unwrap();
-        assert!(s.clock_at("start", 600, "2026-11-05").is_err());
-        s.clock_at("start", 600, "2026-11-06").unwrap();
-        drop(s);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-    #[test]
-    fn migration_and_ciphertext() {
-        let (s, p) = store();
-        s.add("客户保密事项").unwrap();
-        assert_eq!(s.captures().unwrap()[0].title, "客户保密事项");
-        let raw: Vec<u8> =
-            s.db.query_row("SELECT title FROM captures", [], |r| r.get(0))
-                .unwrap();
-        assert!(!raw.windows("客户".len()).any(|w| w == "客户".as_bytes()));
-        assert!(s.add("").is_err());
-        drop(s);
-        let s = Store::open(&p).unwrap();
-        assert_eq!(s.captures().unwrap().len(), 1);
-        assert!(p.join("before-migration-v1.db").exists());
-        drop(s);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-}
+fn default_month_days()->i64{let d=Local::now().date_naive();let next=if d.month()==12{NaiveDate::from_ymd_opt(d.year()+1,1,1).unwrap()}else{NaiveDate::from_ymd_opt(d.year(),d.month()+1,1).unwrap()};let mut day=NaiveDate::from_ymd_opt(d.year(),d.month(),1).unwrap();let mut n=0;while day<next{if day.weekday().num_days_from_monday()<5{n+=1}day=day.succ_opt().unwrap()}n}
+fn hash(bytes:&[u8])->String{Sha256::digest(bytes).iter().map(|b|format!("{b:02x}")).collect()}
+fn info(path:&Path,kind:&str,created_at:i64,bytes:&[u8])->BackupInfo{BackupInfo{id:path.file_name().unwrap().to_string_lossy().to_string(),created_at,kind:kind.into(),size:bytes.len() as i64,checksum:hash(bytes),location:path.parent().unwrap().to_string_lossy().to_string()}}
+fn validate_db(path:&Path)->Result<(),String>{let db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_|"备份数据库无法打开")?;let ok:String=db.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(db_error)?;if ok!="ok"{return Err("备份数据库完整性检查失败".into())}let v:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(db_error)?;if v>2{return Err("备份来自较新版本".into())}Ok(())}
+
+#[cfg(test)] mod tests{use super::*;fn store()->(Store,PathBuf){let p=std::env::temp_dir().join(format!("eow-test-{}",rand::random::<u64>()));(Store::open(&p).unwrap(),p)}#[test]fn clock_restart_midnight_and_lock(){let(mut s,p)=store();s.clock_at("start",100,"2026-11-05").unwrap();assert!(s.clock_at("start",200,"2026-11-05").is_err());assert_eq!(s.snapshot_at(32500,"2026-11-06").unwrap().status,"overtime");drop(s);let mut s=Store::open(&p).unwrap();s.clock_at("finish",500,"2026-11-06").unwrap();assert!(s.clock_at("start",600,"2026-11-05").is_err());s.clock_at("start",600,"2026-11-06").unwrap();drop(s);fs::remove_dir_all(p).unwrap();}#[test]fn task_backup_restore(){let(mut s,p)=store();let id=s.save_task(TaskInput{id:None,title:"下周三提交报价".into(),notes:None,planned_date:Some("2026-11-11".into()),date_kind:Some("exact".into()),due_at:None,priority:Some("high".into()),project:None,source:Some("manual".into())}).unwrap();s.task_action(id,"complete",Some("已提交")).unwrap();assert_eq!(s.tasks("completed","").unwrap()[0].result,"已提交");let b=s.create_backup(Some("12345678")).unwrap();s.task_action(id,"delete",None).unwrap();s.restore_backup(&b.id,Some("12345678")).unwrap();assert_eq!(s.tasks("completed","").unwrap().len(),1);drop(s);fs::remove_dir_all(p).unwrap();}}

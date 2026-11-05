@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod capture;
 mod crypto;
+mod dates;
 mod repository;
 mod windows;
 use std::sync::{
@@ -39,14 +40,11 @@ fn clock(
     action: String,
 ) -> Result<(), String> {
     allowed(&w, &["main", "widget"])?;
-    state.store.lock().map_err(|_| "状态忙")?.clock(&action)?;
+    let mut store = state.store.lock().map_err(|_| "状态忙")?;
+    if store.is_locked() { return Err("应用已锁定，请先解锁".into()); }
+    store.clock(&action)?;
     changed(&app);
     Ok(())
-}
-#[tauri::command]
-fn captures(w: WebviewWindow, state: State<AppState>) -> Result<Vec<repository::Capture>, String> {
-    allowed(&w, &["main"])?;
-    state.store.lock().map_err(|_| "状态忙")?.captures()
 }
 #[tauri::command]
 fn add_capture(
@@ -56,7 +54,12 @@ fn add_capture(
     title: String,
 ) -> Result<(), String> {
     allowed(&w, &["main", "quick_add"])?;
-    state.store.lock().map_err(|_| "状态忙")?.add(&title)?;
+    let parsed = dates::parse(&title);
+    state.store.lock().map_err(|_| "状态忙")?.save_task(repository::TaskInput {
+        id: None, title, notes: None, planned_date: parsed.planned_date,
+        date_kind: Some(parsed.date_kind), due_at: parsed.due_at,
+        priority: Some("medium".into()), project: None, source: Some("capture".into()),
+    })?;
     *state.draft.lock().map_err(|_| "状态忙")? = capture::Draft::default();
     changed(&app);
     Ok(())
@@ -100,6 +103,8 @@ fn window_action(w: WebviewWindow, app: tauri::AppHandle, action: String) -> Res
 struct Settings {
     autostart: bool,
     shortcut: String,
+    lock_enabled: bool,
+    locked: bool,
 }
 #[tauri::command]
 fn settings(
@@ -108,14 +113,69 @@ fn settings(
     state: State<AppState>,
 ) -> Result<Settings, String> {
     allowed(&w, &["main"])?;
+    let (lock_enabled, locked) = {
+        let store = state.store.lock().map_err(|_| "状态忙")?;
+        (store.lock_enabled(), store.is_locked())
+    };
     Ok(Settings {
         autostart: app
             .autolaunch()
             .is_enabled()
             .map_err(|_| "启动项查询失败")?,
         shortcut: state.shortcut.lock().map_err(|_| "状态忙")?.clone(),
+        lock_enabled,
+        locked,
     })
 }
+
+#[tauri::command]
+fn parse_task_date(text: String) -> dates::DateParse { dates::parse(&text) }
+
+#[tauri::command]
+fn tasks(w: WebviewWindow, state: State<AppState>, view: String, query: String) -> Result<Vec<repository::Task>, String> {
+    allowed(&w, &["main"])?;
+    state.store.lock().map_err(|_| "状态忙")?.tasks(&view, &query)
+}
+
+#[tauri::command]
+fn save_task(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, input: repository::TaskInput) -> Result<i64, String> {
+    allowed(&w, &["main", "quick_add"])?;
+    let id = state.store.lock().map_err(|_| "状态忙")?.save_task(input)?;
+    *state.draft.lock().map_err(|_| "状态忙")? = capture::Draft::default(); changed(&app); Ok(id)
+}
+
+#[tauri::command]
+fn task_action(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, id: i64, action: String, result: Option<String>) -> Result<(), String> {
+    allowed(&w, &["main", "widget"])?;
+    state.store.lock().map_err(|_| "状态忙")?.task_action(id, &action, result.as_deref())?; changed(&app); Ok(())
+}
+
+#[tauri::command]
+fn preferences(w: WebviewWindow, state: State<AppState>) -> Result<repository::Preferences, String> { allowed(&w, &["main", "widget"])?; state.store.lock().map_err(|_| "状态忙")?.preferences() }
+
+#[tauri::command]
+fn save_preferences(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, input: repository::Preferences) -> Result<(), String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.save_preferences(&input)?; changed(&app); Ok(()) }
+
+#[tauri::command]
+fn workdays(w: WebviewWindow, state: State<AppState>) -> Result<Vec<repository::Workday>, String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.workdays() }
+
+#[tauri::command]
+fn save_workday(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, input: repository::WorkdayInput) -> Result<(), String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.save_workday(input)?; changed(&app); Ok(()) }
+
+#[tauri::command]
+fn backups(w: WebviewWindow, state: State<AppState>) -> Result<Vec<repository::BackupInfo>, String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.backups() }
+
+#[tauri::command]
+fn create_backup(w: WebviewWindow, state: State<AppState>, password: Option<String>) -> Result<repository::BackupInfo, String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.create_backup(password.as_deref()) }
+
+#[tauri::command]
+fn restore_backup(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, id: String, password: Option<String>) -> Result<(), String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.restore_backup(&id, password.as_deref())?; changed(&app); Ok(()) }
+
+#[tauri::command]
+fn unlock(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, password: String) -> Result<(), String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.unlock(&password)?; changed(&app); Ok(()) }
+
+#[tauri::command]
+fn set_app_lock(w: WebviewWindow, app: tauri::AppHandle, state: State<AppState>, enabled: bool, password: String) -> Result<(), String> { allowed(&w, &["main"])?; state.store.lock().map_err(|_| "状态忙")?.set_lock(enabled, &password)?; changed(&app); Ok(()) }
 #[tauri::command]
 fn set_autostart(w: WebviewWindow, app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     allowed(&w, &["main"])?;
@@ -209,13 +269,25 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             clock,
-            captures,
             add_capture,
             draft,
             window_action,
             settings,
             set_autostart,
-            set_shortcut
+            set_shortcut,
+            parse_task_date,
+            tasks,
+            save_task,
+            task_action,
+            preferences,
+            save_preferences,
+            workdays,
+            save_workday,
+            backups,
+            create_backup,
+            restore_backup,
+            unlock,
+            set_app_lock
         ])
         .setup(|app| {
             let dir = app.path().app_data_dir()?.join("data");
