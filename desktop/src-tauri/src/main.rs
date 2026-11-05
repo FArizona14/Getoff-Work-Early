@@ -81,7 +81,7 @@ fn window_action(w: WebviewWindow, app: tauri::AppHandle, action: String) -> Res
             }
         }
         "quick" => {
-            allowed(&w, &["main"])?;
+            allowed(&w, &["main", "widget"])?;
             *app.state::<AppState>().draft.lock().map_err(|_| "状态忙")? =
                 capture::Draft::default();
             windows::show(&app, "quick_add");

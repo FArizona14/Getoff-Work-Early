@@ -1,4 +1,5 @@
-//! Only user-triggered plain Unicode text capture. Never destroy unknown formats.
+//! User-triggered plain Unicode text capture. Restore old clipboard data only when it is safely
+//! representable as Unicode text; otherwise keep the user's newly copied selection.
 use serde::Serialize;
 use std::{
     ptr::null_mut,
@@ -78,15 +79,18 @@ fn capture_inner(owner: HWND) -> Result<Draft, String> {
         let foreground: HWND = GetForegroundWindow();
         let old;
         let before;
+        let can_restore;
         {
             let _guard = Clipboard::open()?;
             let mut format = EnumClipboardFormats(0);
+            let mut text_only = true;
             while format != 0 {
                 if ![1, 7, 13, 16].contains(&format) {
-                    return Err("原剪贴板包含图片、文件或富文本，本次未触发复制；请手动粘贴".into());
+                    text_only = false;
                 }
                 format = EnumClipboardFormats(format);
             }
+            can_restore = text_only;
             old = if IsClipboardFormatAvailable(UNICODE) != 0 {
                 Some(read_text()?)
             } else {
@@ -125,8 +129,12 @@ fn capture_inner(owner: HWND) -> Result<Draft, String> {
             captured_seq = GetClipboardSequenceNumber();
             text = read_text();
         }
-        let mut notice = "已采集；原纯文本剪贴板已恢复".to_string();
-        {
+        let mut notice = if can_restore {
+            "已提取选中文字；原纯文本剪贴板已恢复".to_string()
+        } else {
+            "已提取选中文字；原剪贴板含富文本，本次复制结果已保留".to_string()
+        };
+        if can_restore {
             let _guard = Clipboard::open()?;
             if GetClipboardSequenceNumber() == captured_seq {
                 // Only restore while the clipboard is exclusively locked and its sequence matches.
