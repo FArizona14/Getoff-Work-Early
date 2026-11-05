@@ -1,0 +1,8 @@
+{
+  "seconds": 10.08,
+  "processCount": 9,
+  "cpuPercentWholeMachine": 0.019,
+  "workingSetMiB": 534.25,
+  "privateMiB": 334.41,
+  "note": "包含主进程及采样开始时的 WebView2 子进程；短时观察，不代表长期性能"
+}

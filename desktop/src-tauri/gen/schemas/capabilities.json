@@ -1,0 +1,1 @@
+{"desktop-windows":{"identifier":"desktop-windows","description":"本地窗口仅允许领域事件与窗口拖动；系统操作由 Rust 窄接口校验","local":true,"windows":["main","widget","quick_add"],"permissions":["core:event:allow-listen","core:event:allow-unlisten","core:window:allow-start-dragging"]}}
